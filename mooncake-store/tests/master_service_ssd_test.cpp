@@ -4,6 +4,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -569,6 +573,112 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     ASSERT_FALSE(r1.has_value())
         << "empty segment names must not report a silent success (issue #2997)";
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
+}
+
+
+namespace {
+class ScopedReadAdmission {
+   public:
+    explicit ScopedReadAdmission(const char* value) {
+        if (const char* old = std::getenv(kName)) previous_ = old;
+        setenv(kName, value, 1);
+    }
+    ~ScopedReadAdmission() {
+        if (previous_) setenv(kName, previous_->c_str(), 1);
+        else unsetenv(kName);
+    }
+    static constexpr const char* kName =
+        "MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD";
+   private:
+    std::optional<std::string> previous_;
+};
+}  // namespace
+
+TEST_F(MasterServiceSSDTest, ReadAdmissionZeroKeepsEagerOffload) {
+    ScopedReadAdmission env("0");
+    auto service = CreateSsdAwareOffloadService();
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client, "read_admit_default", 0x710000000);
+    ASSERT_TRUE(service->PutStart(client, "cold", TenantId::Default(), 1024,
+                                  {.replica_num = 1}).has_value());
+    ASSERT_TRUE(service->PutEnd(client, "cold", TenantId::Default(),
+                                ReplicaType::MEMORY).has_value());
+    auto tasks = service->OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1);
+    EXPECT_EQ(tasks->front().key, "cold");
+}
+
+TEST_F(MasterServiceSSDTest, ReadAdmissionCountsDemandAndDeduplicatesTasks) {
+    ScopedReadAdmission env("2");
+    for (const bool batch : {false, true}) {
+        auto service = CreateSsdAwareOffloadService();
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(*service, client, "read_admit_node", 0x720000000);
+        ASSERT_TRUE(service->PutStart(client, "hot", TenantId::Default(), 1024,
+                                      {.replica_num = 1}).has_value());
+        ASSERT_TRUE(service->PutEnd(client, "hot", TenantId::Default(),
+                                    ReplicaType::MEMORY).has_value());
+        auto tasks = service->OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        EXPECT_TRUE(tasks->empty());
+
+        for (int i = 0; i < 3; ++i) {
+            ASSERT_TRUE(service->GetReplicaListForAdmin(
+                "hot", TenantId::Default()).has_value());
+            auto admin = service->BatchGetReplicaListForAdmin(
+                {"hot", "hot"}, TenantId::Default());
+            ASSERT_EQ(admin.size(), 2);
+            ASSERT_TRUE(admin[0].has_value());
+            ASSERT_TRUE(admin[1].has_value());
+        }
+        tasks = service->OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        EXPECT_TRUE(tasks->empty());
+        for (int read = 0; read < 2; ++read) {
+            if (batch) {
+                auto found = service->BatchGetReplicaList(
+                    {"hot", "hot"}, TenantId::Default());
+                ASSERT_EQ(found.size(), 2);
+                ASSERT_TRUE(found[0].has_value());
+                ASSERT_TRUE(found[1].has_value());
+            } else {
+                ASSERT_TRUE(service->GetReplicaList(
+                    "hot", TenantId::Default()).has_value());
+            }
+            if (read == 0) {
+                tasks = service->OffloadObjectHeartbeat(client, true);
+                ASSERT_TRUE(tasks.has_value());
+                EXPECT_TRUE(tasks->empty());
+            }
+        }
+        // Additional lookups while the copy is pending must not enqueue again.
+        ASSERT_TRUE(service->GetReplicaList(
+            "hot", TenantId::Default()).has_value());
+        tasks = service->OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        ASSERT_EQ(tasks->size(), 1);
+        EXPECT_EQ(tasks->front().key, "hot");
+        ASSERT_TRUE(service->GetReplicaList(
+            "hot", TenantId::Default()).has_value());
+        tasks = service->OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        EXPECT_TRUE(tasks->empty());
+    }
+}
+
+TEST_F(MasterServiceSSDTest, ReadAdmissionRejectsInvalidOrConflictingSettings) {
+    {
+        ScopedReadAdmission env("bad");
+        EXPECT_THROW(CreateSsdAwareOffloadService(), std::invalid_argument);
+    }
+    {
+        ScopedReadAdmission env("2");
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        EXPECT_THROW(MasterService{config}, std::invalid_argument);
+    }
 }
 
 }  // namespace mooncake::test

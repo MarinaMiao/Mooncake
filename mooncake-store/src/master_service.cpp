@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <algorithm>
 #include <bitset>
 #include <cassert>
@@ -380,6 +381,27 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+    }
+
+
+    // Opt-in scan-resistant admission. Zero preserves eager PutEnd offload.
+    if (const char* value =
+            std::getenv("MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD")) {
+        const char* end = value + std::strlen(value);
+        const auto parsed = std::from_chars(
+            value, end, offload_read_admission_threshold_);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) {
+            throw std::invalid_argument(
+                "Invalid MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD");
+        }
+    }
+    if (offload_read_admission_threshold_ > 0 && offload_on_evict_) {
+        throw std::invalid_argument(
+            "Read admission cannot be combined with offload_on_evict");
+    }
+    if (enable_offload_ && offload_read_admission_threshold_ > 0) {
+        LOG(INFO) << "SSD read admission threshold="
+                  << offload_read_admission_threshold_;
     }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
@@ -4828,6 +4850,57 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     return results;
 }
 
+
+void MasterService::QueueOffload(const ObjectIdentity& object_id,
+                                 TenantState& tenant_state,
+                                 ObjectMetadata& metadata) {
+    // Preserve PutEnd's mirror and source-pin ownership.
+    std::optional<ReplicaID> source_id;
+    std::vector<UUID> mirror_clients;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_completed() && replica.is_memory_replica();
+        },
+        [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
+            auto result =
+                PushOffloadingQueue(object_id, replica, &mirror_clients);
+            if (result && !source_id.has_value()) {
+                replica.inc_refcnt();
+                source_id = replica.id();
+            }
+        });
+    if (source_id.has_value()) {
+        tenant_state.offloading_tasks.emplace(
+            object_id.user_key,
+            OffloadingTask{*source_id, std::chrono::system_clock::now(),
+                           std::move(mirror_clients)});
+    }
+}
+
+void MasterService::TryQueueReadOffload(const ObjectIdentity& object_id) {
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) return;
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+    // The source lookup of an existing offload task is internal traffic.
+    if (tenant_state.offloading_tasks.contains(object_id.user_key) ||
+        metadata.HasReplica([](const Replica& replica) {
+            return replica.is_local_disk_replica() ||
+                   (replica.is_dfs_replica() && replica.is_processing());
+        }) ||
+        !metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() && replica.is_completed();
+        })) {
+        return;
+    }
+    if (metadata.offload_read_count < offload_read_admission_threshold_) {
+        ++metadata.offload_read_count;
+    }
+    if (metadata.offload_read_count >= offload_read_admission_threshold_) {
+        QueueOffload(object_id, tenant_state, metadata);
+    }
+}
+
 auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
@@ -4836,6 +4909,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
+    bool read_offload_eligible = false;
     bool dynamic_replication_observed = false;
     {
         MetadataAccessorRO accessor(this, object_id);
@@ -4886,6 +4960,12 @@ auto MasterService::GetReplicaList(const std::string& key,
         metadata.GrantReadLease(
             std::chrono::milliseconds(default_kv_lease_ttl_));
 
+        read_offload_eligible =
+            enable_offload_ && offload_read_admission_threshold_ > 0 &&
+            metadata.HasReplica([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            });
+
         // Promotion-on-hit eligibility: only when no MEMORY replica is
         // present but at least one LOCAL_DISK replica is. Decided here while
         // we hold the RO accessor; the actual enqueue happens after we
@@ -4919,6 +4999,9 @@ auto MasterService::GetReplicaList(const std::string& key,
                                       metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
+    if (read_offload_eligible) {
+        TryQueueReadOffload(object_id);
+    }
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
     }
@@ -4990,6 +5073,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::vector<ObjectIdentity> read_offload_candidates;
+        std::unordered_set<std::string> read_offload_seen;
         std::vector<ObjectIdentity> dynamic_replication_candidates;
         std::unordered_set<std::string> dynamic_replication_seen;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -5060,6 +5145,16 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 metadata.GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
 
+                if (enable_offload_ &&
+                    offload_read_admission_threshold_ > 0 &&
+                    metadata.HasReplica([](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.is_completed();
+                    }) && read_offload_seen.insert(key).second) {
+                    read_offload_candidates.push_back(
+                        MakeObjectIdentity(key, normalized_tenant));
+                }
+
                 if (promotion_on_hit_) {
                     const bool any_memory =
                         std::any_of(replica_list.begin(), replica_list.end(),
@@ -5103,6 +5198,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             }
         }
 
+        for (const auto& object_id : read_offload_candidates) {
+            TryQueueReadOffload(object_id);
+        }
         for (const auto& object_id : promotion_candidates) {
             TryPushPromotionQueue(object_id);
         }
@@ -5826,32 +5924,11 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+        !offload_on_evict_ && offload_read_admission_threshold_ == 0 &&
+        !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
-        auto& tenant_state = accessor.GetTenantState();
-        // One marker covers every mirror pushed below, so the mirrors are
-        // collected before the marker is recorded.
-        std::optional<ReplicaID> source_id;
-        std::vector<UUID> mirror_clients;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
-            },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
-                if (result && !source_id.has_value()) {
-                    replica.inc_refcnt();
-                    source_id = replica.id();
-                }
-            });
-        if (source_id.has_value()) {
-            tenant_state.offloading_tasks.emplace(
-                object_id.user_key,
-                OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)});
-        }
+        QueueOffload(object_id, accessor.GetTenantState(), metadata);
     }
 
     // If the object is completed, remove it from the processing set.

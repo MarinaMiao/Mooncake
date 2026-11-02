@@ -100,6 +100,8 @@ struct ObjectMetadata {
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
     const size_t size;
+    // Guarded by the owning metadata shard; not persisted across restarts.
+    uint32_t offload_read_count{0};
     std::optional<uint64_t> object_checksum;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;

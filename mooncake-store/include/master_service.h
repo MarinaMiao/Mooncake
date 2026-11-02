@@ -1618,6 +1618,10 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
+    void QueueOffload(const ObjectIdentity& object_id,
+                      TenantState& tenant_state, ObjectMetadata& metadata);
+    void TryQueueReadOffload(const ObjectIdentity& object_id);
+
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
@@ -2101,6 +2105,7 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
+    uint32_t offload_read_admission_threshold_{0};
     // Force-evict: allow evicting MEMORY replicas without disk offload when cap
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
