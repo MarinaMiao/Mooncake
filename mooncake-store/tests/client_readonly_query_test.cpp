@@ -14,6 +14,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -160,6 +162,82 @@ TEST_F(ClientReadOnlyQueryTest, BatchPreservesOrderAndPerKeyErrors) {
 
     ASSERT_FALSE(read_only[1].has_value());
     EXPECT_EQ(read_only[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST(ClientReadAdmissionTest, RepeatedPutDoesNotCountAsDemandRead) {
+    google::InitGoogleLogging("ClientReadAdmissionTest");
+    FLAGS_logtostderr = true;
+    const char* previous =
+        std::getenv("MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD");
+    const std::optional<std::string> saved =
+        previous ? std::make_optional<std::string>(previous) : std::nullopt;
+    struct Cleanup {
+        std::optional<std::string> saved;
+        ~Cleanup() {
+            if (saved) {
+                setenv("MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD",
+                       saved->c_str(), 1);
+            } else {
+                unsetenv("MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD");
+            }
+            google::ShutdownGoogleLogging();
+        }
+    } cleanup{saved};
+    setenv("MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD", "2", 1);
+    std::unordered_set<int> ports;
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_rpc_port(GetTestPort(ports))
+                                 .set_http_metrics_port(GetTestPort(ports))
+                                 .set_enable_offload(true)
+                                 .set_default_kv_lease_ttl(0)
+                                 .build()));
+    auto real = RealClient::create();
+    ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME,
+         "127.0.0.1:" + std::to_string(GetTestPort(ports))},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "16777216"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "16777216"},
+        {CONFIG_KEY_PROTOCOL, "tcp"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, master.master_address()},
+    };
+    ASSERT_TRUE(real->setup_internal(config).has_value());
+    auto client = real->client_;
+    ASSERT_TRUE(client->MountLocalDiskSegment(true).has_value());
+    client->SetLocalDiskProbe(
+        [](const std::string&) -> std::optional<bool> { return false; });
+    std::string value(4096, 'x');
+    for (const bool batch : {false, true}) {
+        const std::string key =
+            batch ? "batch-write-only" : "single-write-only";
+        ASSERT_EQ(
+            real->put(key, std::span<const char>(value.data(), value.size())),
+            0);
+        std::vector<Slice> slices{{value.data(), value.size()}};
+        std::vector<std::vector<Slice>> batches{slices};
+        for (int i = 0; i < 3; ++i) {
+            if (batch) {
+                auto result =
+                    client->BatchPut({key}, batches, {.replica_num = 1});
+                ASSERT_EQ(result.size(), 1);
+                ASSERT_TRUE(result[0].has_value());
+            } else {
+                ASSERT_TRUE(
+                    client->Put(key, slices, {.replica_num = 1}).has_value());
+            }
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks).has_value());
+        EXPECT_TRUE(tasks.empty()) << "idempotent Put must not admit cold data";
+        ASSERT_TRUE(client->Query(key).has_value());
+        ASSERT_TRUE(client->Query(key).has_value());
+        tasks.clear();
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks).has_value());
+        ASSERT_EQ(tasks.size(), 1);
+        EXPECT_EQ(tasks.front().key, key);
+    }
+    EXPECT_EQ(real->tearDownAll(), 0);
 }
 
 }  // namespace

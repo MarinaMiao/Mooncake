@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
@@ -18,6 +19,9 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    // Volatile SSD admission count, guarded by the key lock. Saturates at the
+    // configured threshold; not serialized in snapshots or the OpLog.
+    uint32_t offload_read_count{0};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;

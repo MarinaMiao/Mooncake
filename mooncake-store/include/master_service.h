@@ -1561,6 +1561,12 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
+    // Caller holds the object's key for writing. Reuse PutEnd's source-pin
+    // and mirror-task ownership for read-triggered SSD admission.
+    void QueueOffload(const ObjectIdentity& object_id,
+                      route::ObjectState& state, ObjectMetadata& metadata);
+    void TryQueueReadOffload(const ObjectIdentity& object_id);
+
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
@@ -1879,8 +1885,9 @@ class MasterService {
         const;
 
     // The work client reads leave for when they hold no lock on any key:
-    // queueing a promotion for each read served only from LOCAL_DISK, and
-    // counting each object's access towards another memory replica once.
+    // admitting each object's SSD offload once, queueing a promotion for each
+    // read served only from LOCAL_DISK, and counting each object's access
+    // towards another memory replica once.
     class ReadFollowUps {
        public:
         void Promote(const TenantId& tenant_id, const std::string& key) {
@@ -1891,10 +1898,17 @@ class MasterService {
                 accesses_.push_back({tenant_id, key});
             }
         }
+        void AdmitOffload(const TenantId& tenant_id, const std::string& key) {
+            if (offload_seen_.insert(tenant_id.MakeScopedKey(key)).second) {
+                offloads_.push_back({tenant_id, key});
+            }
+        }
         // The caller holds master_state_mutex_ (shared) and no key.
         void Run(MasterService& service) const;
 
        private:
+        std::vector<ObjectIdentity> offloads_;
+        std::unordered_set<std::string> offload_seen_;
         std::vector<ObjectIdentity> promotions_;
         std::vector<ObjectIdentity> accesses_;
         std::unordered_set<std::string> accessed_;
@@ -1967,6 +1981,7 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
+    uint32_t offload_read_admission_threshold_{0};
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

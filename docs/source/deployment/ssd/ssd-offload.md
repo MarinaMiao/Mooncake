@@ -124,6 +124,45 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 
 ---
 
+(ssd-demand-read-admission)=
+
+### Optional demand-read admission
+
+To avoid writing one-use objects into a limited SSD cache, set the following
+**on the master process before startup**:
+
+```bash
+MOONCAKE_OFFLOAD_READ_ADMISSION_THRESHOLD=2 \
+  mooncake_master --rpc_port=50051 --enable_offload=true
+```
+
+The default is `0` (or unset), which preserves eager offload after successful
+`Put` completion. A positive unsigned 32-bit value suppresses eager offload and
+counts eligible `GetReplicaList` / `BatchGetReplicaList` demand metadata queries
+for readable memory objects. An object is queued for SSD offload once its count
+reaches the threshold. Duplicate keys count once per batch. Existence probes,
+`GetReplicaListForAdmin` / `BatchGetReplicaListForAdmin` read-only queries,
+idempotent Put healing queries, pending offload source lookups, and objects
+already backed by local SSD do not add demand counts. Diagnostic tools that use
+the normal demand RPCs also contribute to the count.
+These counts measure metadata lookups, **not confirmed successful payload
+reads**; a failed payload read can still have contributed a lookup.
+
+Counts saturate at the threshold and are volatile: they are not written to
+snapshots or the OpLog, and reset when the object metadata is recreated or the
+master restarts. If queue admission fails, a later eligible read retries through
+the existing offload path. Concurrent readers cannot queue duplicate tasks.
+The master reuses the existing mirror, source-pin, notification, and task-cleanup
+paths. This setting does not guarantee that a queued object has reached SSD.
+
+Do not combine a positive threshold with `--offload_on_evict=true`; the master
+rejects this configuration. This DRAM-to-SSD policy is independent of
+`--promotion_on_hit`, which moves hot SSD-only objects back to DRAM. It does not
+change bucket grouping or partial-bucket flushing. Small heartbeat batches still
+need a storage backend that can persist them correctly.
+
+---
+
 ## SSD Offload Configuration
 
 ### Core settings

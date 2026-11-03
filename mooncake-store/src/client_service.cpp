@@ -2253,7 +2253,7 @@ bool HasOnlyClientLocalDiskReplicas(
 
 Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
     const ObjectKey& key) {
-    auto replicas = master_client_.GetReplicaList(key);
+    auto replicas = master_client_.GetReplicaListReadOnly(key);
     if (!replicas ||
         !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
         !local_disk_probe_fn_) {
@@ -2619,7 +2619,8 @@ void Client::healDanglingLocalDiskBatchStarts(
     // One round trip for the whole subset: a healthy idempotent batch pays a
     // single batched query and no evictions, and the per-key work left over
     // is a local filesystem probe.
-    auto replica_lists = master_client_.BatchGetReplicaList(candidate_keys);
+    auto replica_lists =
+        master_client_.BatchGetReplicaListReadOnly(candidate_keys);
     if (replica_lists.size() != candidate_keys.size()) {
         return;
     }
